@@ -1,0 +1,16 @@
+# opencode CLI driven headless in the task workspace.
+#
+# opencode owns its own system prompt, tools and compaction. The only model
+# setting it takes is the endpoint and the model id; sampling knobs from the
+# reference protocol (top_p, min_p, seed, reasoning toggles) are not exposed by
+# the CLI, which is recorded in the run summary.
+extends: [../base.yaml]
+
+output_dir: ${EVAL_OUTPUT_ROOT:-eval-results}/swebench-verified/opencode
+
+harness:
+  name: opencode
+  options:
+    # Reuse the machine's opencode binary by default; override to pin a path.
+    binary: ""
+    provider_name: Local OpenAI-compatible endpoint

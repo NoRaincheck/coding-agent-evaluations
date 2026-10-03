@@ -1,0 +1,15 @@
+# pi CLI driven headless in the task workspace.
+#
+# pi owns its system prompt and its tool set (read, bash, edit, write) and
+# manages its own context. Each run gets a private agent directory, so the
+# machine's global pi configuration, extensions and credentials are not visible.
+extends: [../base.yaml]
+
+output_dir: ${EVAL_OUTPUT_ROOT:-eval-results}/swebench-verified/pi
+
+harness:
+  name: pi
+  options:
+    binary: ""
+    thinking: medium
+    tools: [read, bash, edit, write]

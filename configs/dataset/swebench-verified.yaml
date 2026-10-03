@@ -1,0 +1,24 @@
+# SWE-bench Verified (500 tasks), reference protocol.
+#
+# Mirrors the FrogNano preset: three seeds, 131k context, 10800s budget.
+extends: [../base.yaml]
+
+dataset: swebench_verified
+output_dir: ${EVAL_OUTPUT_ROOT:-eval-results}/swebench-verified/leaf
+
+seed: 42
+seeds_per_task: 3
+max_workers: ${EVAL_MAX_WORKERS:-1}
+max_steps: 150
+max_context_tokens: 131072
+max_total_time_sec: 10800
+
+model:
+  max_tokens_per_turn: 8192
+  max_retries: 5
+
+runtime:
+  options:
+    # SWE-bench images pin the interpreter per repository revision; `python` is
+    # the default and `python_by_repo` overrides individual repositories.
+    python: "3.9"

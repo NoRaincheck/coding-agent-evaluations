@@ -1,0 +1,53 @@
+# Shared defaults for every evaluation.
+#
+# The model is the only part that changes between experiments. Override it from
+# the environment (or edit `model:` here) to evaluate a different checkpoint on
+# the same OpenAI-compatible endpoint.
+#
+#   EVAL_MODEL_NAME=frognano-4b-2609
+#   EVAL_MODEL_BASE_URL=http://127.0.0.1:1234/v1
+
+dataset: swebench_verified
+output_dir: ${EVAL_OUTPUT_ROOT:-eval-results}/swebench-verified/leaf
+
+# Task selection. `num_tasks: null` runs the whole benchmark.
+task_ids: []
+num_tasks: null
+seed: 42
+seeds_per_task: 1
+max_workers: 1
+max_attempts: 2
+
+# Agent limits.
+max_steps: 150
+max_context_tokens: 131072
+max_total_time_sec: 10800
+resume: true
+
+cache_dir: ${EVAL_CACHE_DIR:-~/.cache/cae/datasets}
+
+model:
+  name: ${EVAL_MODEL_NAME:-frognano-4b-2609}
+  base_url: ${EVAL_MODEL_BASE_URL:-http://127.0.0.1:1234/v1}
+  api_key_env: EVAL_API_KEY
+  temperature: 0.6
+  max_tokens_per_turn: 8192
+  timeout_sec: 7200
+  max_retries: 5
+  parallel_tool_calls: true
+  # Offline token accounting: never fetches a tokenizer from Hugging Face.
+  tokenizer: o200k_base
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: true
+
+harness:
+  name: leaf
+
+runtime:
+  kind: host
+  root: ${EVAL_WORK_ROOT:-~/.cache/cae/workspaces}
+  keep_workspaces: false
+  options:
+    step_timeout_sec: 1800
+    python: "3.9"

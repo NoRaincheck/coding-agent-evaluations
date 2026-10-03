@@ -1,0 +1,32 @@
+[project]
+name = "coding-agent-evaluations"
+version = "0.1.0"
+description = "Cross-harness evaluation of OpenAI-compatible models on SWE-bench Verified and Terminal-Bench 2 Verified"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+authors = [
+    { name = "NoRaincheck", email = "2498638+NoRaincheck@users.noreply.github.com" }
+]
+dependencies = [
+    # The reference implementation. Pinned so leaf-harness behaviour is auditable.
+    "frognano @ git+https://github.com/microsoft/FrogNano.git@7077a19d93f38fa0a7afd58b90a0774b25f6b629",
+    "openai>=2.0",
+    "PyYAML>=6.0",
+    "tiktoken>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+cae = "coding_agent_evaluations.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

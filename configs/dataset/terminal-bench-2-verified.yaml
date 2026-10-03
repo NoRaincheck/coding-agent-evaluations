@@ -1,0 +1,24 @@
+# Terminal-Bench 2.0 Verified (89 tasks).
+#
+# The task Dockerfile is translated to the host instead of being built into a
+# container, so `python` here is only a fallback for base images whose tag does
+# not name an interpreter.
+extends: [../base.yaml]
+
+dataset: terminal_bench_2_verified
+output_dir: ${EVAL_OUTPUT_ROOT:-eval-results}/terminal-bench-2-verified/leaf
+
+seed: 42
+seeds_per_task: 3
+max_workers: ${EVAL_MAX_WORKERS:-1}
+max_steps: 150
+max_context_tokens: 131072
+max_total_time_sec: 10800
+
+model:
+  max_tokens_per_turn: 32000
+  max_retries: 2
+
+runtime:
+  options:
+    python: "3.12"

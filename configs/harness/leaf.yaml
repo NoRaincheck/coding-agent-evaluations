@@ -1,0 +1,11 @@
+# Leaf, the reference harness from FrogNano.
+#
+# This is the baseline every other harness is compared against. Nothing here
+# overrides the harness defaults: leaf speaks to the endpoint directly with the
+# five reference tools (Read, Write, Edit, Glob, Bash).
+extends: [../base.yaml]
+
+output_dir: ${EVAL_OUTPUT_ROOT:-eval-results}/swebench-verified/leaf
+
+harness:
+  name: leaf

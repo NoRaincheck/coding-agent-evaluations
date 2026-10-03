@@ -1,0 +1,11 @@
+# Smoke slice: proves a harness works end to end without a multi-day run.
+#
+# Two tasks, one seed, ten agent steps and a fifteen-minute budget. Enough to
+# reach the verifier; not enough to say anything about the model's ability.
+extends: [../base.yaml]
+
+num_tasks: 2
+seeds_per_task: 1
+max_workers: 1
+max_steps: 10
+max_total_time_sec: 900
