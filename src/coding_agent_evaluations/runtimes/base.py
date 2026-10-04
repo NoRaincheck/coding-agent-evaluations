@@ -27,7 +27,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from frognano.runtimes.errors import CommandTimeoutError, PodExecutionError
+from coding_agent_evaluations._vendor.frognano.runtimes.errors import (
+    CommandTimeoutError,
+    PodExecutionError,
+)
 
 _READ_ATTEMPTS = 3
 

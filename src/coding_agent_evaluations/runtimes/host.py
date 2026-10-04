@@ -20,7 +20,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from frognano.runtimes.errors import CommandTimeoutError
+from coding_agent_evaluations._vendor.frognano.runtimes.errors import (
+    CommandTimeoutError,
+)
 
 from .base import CommandExecutor, ProvisionRecord, SandboxPaths, copy_into
 from .provision import (
@@ -71,9 +73,13 @@ class HostTaskRuntime:
     # -- lifecycle ----------------------------------------------------------
 
     def _prepare(self) -> None:
-        provisioner = build_provisioner(
-            self.paths, self.task, self._provision_options
+        # The reference leaf environment passes `task["repo_path"]` straight to
+        # its tool runner, which chdirs into it. On the host that must be the
+        # real workspace, so the container path is kept separately for mapping.
+        self.task["container_repo_path"] = str(
+            self.task.get("repo_path") or "/app"
         )
+        provisioner = build_provisioner(self.paths, self.task, self._provision_options)
         try:
             self.provision_record = provisioner.provision()
             self._venv_bin = provisioner.venv_bin
@@ -82,6 +88,7 @@ class HostTaskRuntime:
             self.provision_record.error = str(exc)
             provisioner._write_record()
             raise
+        self.task["repo_path"] = str(self.paths.workspace)
         # Keep a pristine copy so pod-style recovery can restore and replay.
         self._snapshot_pristine()
         self.logger.info(
@@ -151,7 +158,7 @@ class HostTaskRuntime:
         self, source: str | Path, destination: str, *, timeout: int = 300
     ) -> None:
         """Copy a file or tree into the workspace (upstream-compatible name)."""
-        target = self._resolve_host_path(destination)
+        target = self._resolve_host_path(destination, directory=Path(source).is_dir())
         copy_into(source, target)
 
     def read_file(self, relative: str) -> str:
@@ -303,7 +310,9 @@ class HostTaskRuntime:
         writable and those paths are uuid-scoped.
         """
         return {
-            str(self.task.get("repo_path") or "/app"): str(self.paths.workspace),
+            str(self.task.get("container_repo_path") or self.task.get("repo_path") or "/app"): str(
+                self.paths.workspace
+            ),
             "/testbed": str(self.paths.workspace),
             "/app": str(self.paths.workspace),
             "/workspace": str(self.paths.workspace),
@@ -314,17 +323,32 @@ class HostTaskRuntime:
             "/solution": str(self.paths.solution),
         }
 
-    def _resolve_host_path(self, value: str) -> Path:
-        """Map a container-absolute path used by a task onto the workspace."""
+    def _resolve_host_path(self, value: str, *, directory: bool = True) -> Path:
+        """Map a container-absolute path used by a task onto the workspace.
+
+        ``directory`` must say whether the path is a directory. Creating it
+        unconditionally would turn a file destination into a directory, and the
+        copy would land inside it — which is how a tool runner silently became an
+        unusable directory.
+        """
         mapping = self._container_path_mapping()
         for original, replacement in sorted(mapping.items(), key=lambda i: -len(i[0])):
             if value == original or value.startswith(original + "/"):
-                candidate = Path(replacement + value[len(original) :])
-                candidate.mkdir(parents=True, exist_ok=True)
-                return candidate
-        candidate = Path(value)
-        candidate.mkdir(parents=True, exist_ok=True)
-        return candidate
+                return self._prepare_destination(Path(replacement + value[len(original) :]), directory)
+        return self._prepare_destination(Path(value), directory)
+
+    @staticmethod
+    def _prepare_destination(path: Path, directory: bool) -> Path:
+        """Create a workspace destination without inventing the wrong kind."""
+        if directory:
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_dir():
+                # Left over from an earlier bug or a previous run: a file cannot
+                # be written over a directory.
+                path.rmdir()
+        return path
 
     @staticmethod
     def _slug(instance_id: str) -> str:

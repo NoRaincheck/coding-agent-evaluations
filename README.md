@@ -6,7 +6,7 @@ Verified** and **Terminal-Bench 2.0 Verified** — once per agent harness:
 
 | Harness | What it is |
 |---|---|
-| `leaf` | The reference harness from FrogNano, used unmodified. The baseline. |
+| `leaf` | The reference harness from FrogNano, vendored at a pinned commit. The baseline. |
 | `opencode` | The opencode CLI, driven headless in the task workspace. |
 | `pi` | The pi CLI, driven headless in the task workspace. |
 
@@ -30,9 +30,9 @@ uv venv --python 3.13
 uv pip install -e '.[dev]'
 ```
 
-The reference implementation is pinned as a dependency
-(`frognano @ git+...@7077a19`), which is what keeps the leaf harness byte-identical
-to upstream. Harnesses are invoked from your own `PATH`:
+FrogNano is **vendored, not installed** — see
+[Licence and provenance](#licence-and-provenance). Harnesses are invoked from
+your own `PATH`:
 
 ```bash
 brew install opencode                                    # or your preferred install
@@ -65,6 +65,9 @@ cae run --config configs/dataset/swebench-verified.yaml --harness leaf
 # Terminal-Bench 2
 cae run --config configs/dataset/terminal-bench-2-verified.yaml --harness pi
 
+# Every model on every harness, from one config file
+cae run --config configs/matrix/local-models.yaml
+
 # A smoke slice
 cae run --config configs/harness/opencode.yaml \
   --set num_tasks=2 --set seeds_per_task=1 --set max_steps=10
@@ -77,13 +80,85 @@ cae run --config configs/dataset/swebench-verified.yaml \
 cae tasks  --config configs/dataset/swebench-verified.yaml
 cae config --config configs/dataset/swebench-verified.yaml
 cae run   --config configs/dataset/swebench-verified.yaml --dry-run
+cae run   --config configs/matrix/local-models.yaml --cells
 
 # Compare finished runs
 cae compare eval-results/ --markdown
 ```
 
-`scripts/run-matrix.sh` runs the whole matrix and prints the comparison table;
-`scripts/smoke.sh` is the fast version.
+`scripts/run-matrix.sh` runs one model through all three harnesses and prints the
+comparison table; `scripts/smoke.sh` is the fast version. For more than one
+model, use a [matrix config](#running-a-matrix) instead of a shell loop.
+
+## Running a matrix
+
+A matrix is "every model on every harness, same tasks, same limits". It is one config file
+rather than a shell loop, so the cells cannot drift apart:
+
+```yaml
+# configs/matrix/local-models.yaml
+extends: [../base.yaml]
+
+num_tasks: 2          # every other setting is inherited, and applies to every cell
+max_steps: 10
+
+matrix:
+  datasets: [swebench_verified]
+  harnesses: [leaf, opencode, pi]
+  models:
+    - frognano-4b-2609                        # inherits base_url from base.yaml
+    - ling-3.0-tiny
+    - name: qwen3.6-35b-a3b-mtp               # or name any field of `model:`
+      base_url: http://127.0.0.1:1234/v1
+```
+
+```bash
+# What would run, without running it
+cae run --config configs/matrix/local-models.yaml --cells
+
+# Check the endpoint can serve every model before spending hours finding out it cannot
+cae doctor --config configs/matrix/local-models.yaml
+
+# Run it
+cae run --config configs/matrix/local-models.yaml
+
+# Then the comparison, from anywhere in the tree
+cae compare eval-results/matrix/ --markdown
+```
+
+Which models are on the endpoint is the server's business, not the config's:
+
+```bash
+curl -s "${EVAL_MODEL_BASE_URL:-http://127.0.0.1:1234/v1}/models" | jq -r '.data[].id'
+```
+
+The run prints one progress bar over the **task-seed pairs of the whole matrix**, not over
+the cells — a cell is a full evaluation, so "3/9 cells" would read as 33% while the fourth
+cell is still grinding through its last forty pairs. The bar's description carries the cell
+that is running, and when it finishes the whole comparison is printed:
+
+```
+swebench_verified/pi/frognano-4b-2609:  38%|████▊      | 190/500 [2:14<3:36, 1.11pair/s]
+```
+
+Notes worth knowing before you scale one up:
+
+- **Cells run one after another.** A cell is already a full evaluation; overlapping cells
+  would multiply disk and endpoint load by the cell count and make the comparison measure
+  contention. Use `max_workers` inside a cell for concurrency.
+- **Each cell gets its own directory**, `<output_dir>/<dataset>/<harness>/<model>/`, which is
+  what makes `cae compare` able to line the whole matrix up afterwards.
+- **One failing cell does not void the matrix** (`matrix.continue_on_error: false` to change
+  that): a model the server lists but cannot load would otherwise discard the measurements
+  taken for the others.
+- **`resume` works per cell**, so an interrupted matrix picks up where it stopped, and the
+  bar counts only the work that is left.
+- **`--set` reaches every cell** (`--set num_tasks=50 --set seeds_per_task=3`), because the
+  cells share one base config. `--harness pi` narrows the matrix instead of overriding it.
+- `--no-progress` drops the bar (for a log file or a CI job); `--markdown` prints the
+  comparison as a table.
+- Matrix runs are the slow case. Start with the shipped `num_tasks: 2 max_steps: 10` to
+  prove the wiring, then scale.
 
 ### Configuration
 
@@ -96,6 +171,7 @@ configs/
   dataset/swebench-verified.yaml       the benchmark preset
   dataset/terminal-bench-2-verified.yaml
   harness/leaf.yaml  opencode.yaml  pi.yaml
+  matrix/local-models.yaml             several models × several harnesses
   profile/smoke.yaml                   small, fast slice
 ```
 
@@ -146,6 +222,7 @@ dropped; see [Comparing harnesses](#comparing-harnesses).
   trajectories/<instance_id>/
     trajectory_seed-<n>.json         messages, steps, tokens, exit reason
     generated_seed-<n>.patch         the diff the agent produced
+    harness_seed-<n>/                the harness's raw stdout/stderr
 ```
 
 `summary.json` keeps the reference runner's accounting: the resolve-rate
@@ -161,7 +238,51 @@ It adds two fields that matter on a single machine:
   `resolve_rate_graded` when you want to know the model's own result.
 
 `limits` records what was actually in force: `max_steps_enforced` and
-`model_params_ignored`.
+`model_params_ignored`. `token_stats` records token speed where the harness
+measures it — see [Token speed](#token-speed).
+
+## Token speed
+
+Token *counts* do not say whether a run was slow or the endpoint was slow. The
+pi harness therefore loads one pinned extension, [pi-token-stats][pi-token-stats],
+which hooks pi's message lifecycle and appends per-message and per-turn
+statistics to the session JSONL: time to first token, decode and prefill
+throughput, tokens, and generation wall time.
+
+It is an **observer**. No prompt, tool, sampling knob or sampling knob the
+harness would otherwise set changes, and the extension is loaded by explicit path
+with `--no-extensions` still in force, so a globally installed pi extension cannot
+enter a measurement. `harness.options.token_stats: false` turns it off.
+
+Where the numbers end up:
+
+| Where | What |
+|---|---|
+| `trajectories/<id>/trajectory_seed-<n>.json` | `token_stats.messages` and `token_stats.turns` — the extension's own entries, unchanged, so they can be re-aggregated later or read with upstream's `jq` recipes |
+| same file, `token_stats.aggregate` | the rollout's numbers: `ttft_ms_mean` / `_p50` / `_p90`, `decode_tps_mean` and `decode_tps_total`, `prefill_tps_mean`, token totals, `generation_sec`, `span_sec` |
+| `results.jsonl`, `token_stats` | the same aggregate per task-seed pair |
+| `summary.json`, `token_stats` | the run-level rollup, rates weighted by request count so one long rollout cannot set the headline |
+| `cae compare` | a second table, since speed is only measured by some harnesses |
+
+Latency is reported as a distribution rather than a mean, because a mean hides
+exactly the tail that makes an evaluation slow. Throughput is reported both as a
+per-request mean and as a ratio of totals — the mean rewards a run made of many
+tiny requests, the ratio does not. A metric the endpoint did not report reads as
+`null`, not `0`, so "never measured" is never mistaken for "measured zero".
+
+The extension is vendored at a pinned commit; see
+[`_vendor/pi_token_stats/PROVENANCE.md`](src/coding_agent_evaluations/_vendor/pi_token_stats/PROVENANCE.md)
+for the commit, why it is vendored rather than installed, and how to update it.
+Point `harness.options.token_stats_extension` at another copy to evaluate a newer
+revision without editing the tree.
+
+To check the wiring against a served model without running a benchmark:
+
+```bash
+.venv/bin/python scripts/smoke_pi_token_stats.py
+```
+
+[pi-token-stats]: https://github.com/NoRaincheck/pi-token-stats
 
 ## How it works
 
@@ -197,7 +318,9 @@ a shared shape. `opencode` and `pi` are real CLIs with their own prompts, tools
 and compaction, so the adapters run the CLIs headless rather than reimplementing
 any of it. Each rollout is hermetic — a private `XDG_*` tree and, for pi, a
 private `PI_CODING_AGENT_DIR` — so your global agent configuration, extensions
-and credentials cannot leak into a measurement.
+and credentials cannot leak into a measurement. The one extension a pi rollout
+loads is named explicitly and vendored, so the measurement has exactly one
+observer in it and that observer is pinned ([Token speed](#token-speed)).
 
 ## Fidelity: what this does and does not reproduce
 
@@ -207,7 +330,7 @@ worth being explicit about what it changes.
 **Reproduced faithfully**
 
 - The leaf agent, its five tools, its system prompt and its tool schemas —
-  imported from the pinned FrogNano commit, not reimplemented.
+  vendored from the pinned FrogNano commit, not reimplemented.
 - Task selection, shuffling, seeds, resume semantics and summary accounting.
 - Patch capture: `git add -A` + `git diff --cached --binary`, index reset so
   agent-created files survive grading.
@@ -290,6 +413,10 @@ same:
 For a fair comparison, set the time budget so tight that every harness is
 time-bound, or accept that leaf is step-bound and the CLIs are clock-bound.
 
+A second table appears when any run measured token speed. It is not comparable
+across harnesses that did not measure it, and `cae compare` says so in its notes
+— see [Token speed](#token-speed).
+
 ## Development
 
 ```bash
@@ -298,14 +425,52 @@ time-bound, or accept that leaf is step-bound and the CLIs are clock-bound.
 
 The test suite runs offline: it covers config composition and env expansion,
 verifier translation, the command executor's exit-code/timeout/checksum
-behaviour, Dockerfile parsing, patch capture, reward extraction, harness
+behaviour, Dockerfile parsing, patch capture, reward extraction, matrix expansion
+and progress accounting, pi token-speed reading and roll-up, harness
 configuration generation and the comparison report. It does not call a model.
+
+### Running the tests against a config matrix
+
+Harness tests are parametrised over the same matrix a run uses — local models ×
+harnesses — and each cell is resolved from that harness's own shipped config, so a
+test asserting a harness is wired for a model asserts what the runner asserts. By
+default the matrix is the configured model crossed with all three harnesses; point
+it elsewhere with the environment:
+
+```bash
+# The default: the model in EVAL_MODEL_NAME (or configs/base.yaml) × leaf, opencode, pi
+.venv/bin/python -m pytest tests -q
+
+# A different set of local models, and only one harness
+EVAL_MATRIX_MODELS='qwen3.6-35b-a3b-mtp,ling-3.0-tiny' \
+EVAL_MATRIX_HARNESSES=pi \
+  .venv/bin/python -m pytest tests -q
+
+# A different endpoint for the whole matrix
+EVAL_MATRIX_BASE_URL=http://127.0.0.1:1235/v1 .venv/bin/python -m pytest tests -q
+
+# Just the matrix tests, or one harness's cells
+.venv/bin/python -m pytest tests -q -k matrix
+.venv/bin/python -m pytest tests -q -k "matrix and pi"
+.venv/bin/python -m pytest tests --collect-only -q -k matrix   # show the cells
+```
+
+A model entry may be a bare served id (`- a, b`) or pin its own endpoint
+(`- name: b` with `base_url:`); an omitted `base_url` comes from
+`EVAL_MATRIX_BASE_URL`, then `EVAL_MODEL_BASE_URL`, then the config default.
+
+```bash
+# Against a real endpoint and the real pi CLI (skips when either is unavailable)
+.venv/bin/python scripts/smoke_pi_token_stats.py
+```
 
 Layout:
 
 ```
 src/coding_agent_evaluations/
   config.py        config composition, env expansion, model settings
+  matrix.py        matrix configs: models × harnesses → run configs
+  matrix_runner.py runs the cells in order, with the progress bar
   datasets.py      pinned task sources and selection
   runner.py        seeds, workers, resume, results and summary
   report.py        cross-harness comparison
@@ -317,10 +482,14 @@ src/coding_agent_evaluations/
     provision.py   workspace provisioning per benchmark
     translate.py   container-to-host path and command translation
   harnesses/
-    leaf.py        reference harness (imported from frognano)
+    leaf.py        reference harness (drives the vendored FrogNano Leaf agent)
     cli.py         shared CLI harness plumbing
     opencode.py    opencode adapter
     pi.py          pi adapter
+    pi_stats.py    reads the token-speed entries out of a pi session
+  _vendor/
+    frognano/      pinned FrogNano subset (MIT, Microsoft Corporation)
+    pi_token_stats/ pinned pi-token-stats extension (see its PROVENANCE.md)
 ```
 
 ## Licence and provenance
@@ -329,3 +498,64 @@ The benchmarks, the reference harness and the task definitions come from
 microsoft/FrogNano and laude-institute/harbor-datasets, pinned by commit. This
 project vendors no model weights and contacts no model host other than the
 OpenAI-compatible endpoint you configure.
+
+### Why FrogNano is vendored
+
+FrogNano was originally a pinned git **dependency**
+(`frognano @ git+...@7077a19d93f38fa0a7afd58b90a0774b25f6b629`). It is now
+**vendored** into `src/coding_agent_evaluations/_vendor/frognano/`, at that same
+commit, and imported through that path rather than as a top-level package.
+
+The reason is the dependency graph, not preference. As a dependency, FroNano
+forced this project to install `kubernetes==36.0.3` — 3,650 lines of a runtime
+this project never executes, because the host runtime replaces it — purely to
+satisfy a module-level import and a type annotation in
+`frognano/harness/leaf/environment.py`. Vendoring lets that seam be cut. FroNano
+also pinned `openai==3.13.0` and pulled `transformers` for a Hugging Face
+tokenizer fallback that this project never reaches. Dropping the dependency
+removes `kubernetes` and `transformers` from the install entirely; the remaining
+three dependencies are the ones actually imported.
+
+Vendored code is excluded from `ruff check` and `ruff format` so it stays
+diffable against upstream. Upstream is MIT licensed (Copyright (c) Microsoft
+Corporation); the notice ships in `_vendor/frognano/LICENSE`.
+
+### Why pi-token-stats is vendored
+
+The pi extension from
+[NoRaincheck/pi-token-stats](https://github.com/NoRaincheck/pi-token-stats) is
+vendored into `src/coding_agent_evaluations/_vendor/pi_token_stats/` at commit
+`fb1abd2`, unmodified, and loaded from there by explicit path.
+
+Which metrics exist and what they mean is part of what a run reports, so the
+extension a run measured with has to be pinned rather than fetched from `main` at
+run time — and rollouts run with `PI_OFFLINE=1` anyway. Vendoring also keeps it out
+of the machine's global pi installation, which the harness otherwise makes invisible
+to a measurement. `_vendor/pi_token_stats/PROVENANCE.md` carries the commit, the
+upstream README, the two upstream behaviours the harness does not paper over
+(`stopReason` is assigned after the entry is serialised, so it never lands in the
+session; `cacheAwarePrefillTokens` only exists when the provider reports cache
+reads, which a local endpoint usually does not), and the update recipe.
+
+**What was vendored** — the closure of what this project imports, and nothing
+more: `datasets/` (task sources and revisions), `harness/leaf/` (the agent, its
+five tools, its tool runner, its system prompt), `runtimes/errors.py` and
+`runtimes/python.py`, and `config.py` for `DEFAULT_MAX_TOKENS_PER_TURN`.
+**Not vendored** — `runtimes/kubernetes.py`, `runner.py`, `cli.py`, `wandb.py`
+and `configs/`: all reachable only through the reference runner or the cluster
+path, none of it on this project's import path.
+
+**Divergences from upstream**, both mechanical and marked `VENDORED DIVERGENCE`
+in-file:
+
+| Divergence | Why it is safe |
+|---|---|
+| `from frognano.` → `from coding_agent_evaluations._vendor.frognano.` | Import path only. |
+| `LeafEnvironment.__init__`'s `KubernetesTaskRuntime` annotation left unresolved, and `runtimes/__init__.py` no longer re-exports it | `from __future__ import annotations` makes the annotation a string, so it is never evaluated. The runtime is duck-typed — Leaf calls only `get_task_instruction`, `run`, `copy_to_container`, `get_patch`, `compute_reward`, `recreate`, and reads `.logger` and `.task`. |
+
+Nothing else differs. The agent loop, the five tools, the tool schemas, the
+system prompt and the tool runner are unmodified, so the leaf baseline still
+measures the reference agent. One consequence is worth stating plainly:
+`config.py` reaches `files("frognano.configs.eval")` to load packaged eval YAML,
+and `configs/` is not vendored, so those two loader functions are unreachable.
+Only `DEFAULT_MAX_TOKENS_PER_TURN` is consumed from that module.

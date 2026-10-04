@@ -351,7 +351,9 @@ class Provisioner:
     def _container_paths(self) -> dict[str, str]:
         """Container path prefixes that map onto the workspace."""
         mapping = {
-            str(self.task.get("repo_path") or "/app"): str(self.paths.workspace),
+            str(
+                self.task.get("container_repo_path") or self.task.get("repo_path") or "/app"
+            ): str(self.paths.workspace),
         }
         for alias in ("/app", "/workspace", "/testbed", "/src", "/opt/app"):
             mapping.setdefault(alias, str(self.paths.workspace))

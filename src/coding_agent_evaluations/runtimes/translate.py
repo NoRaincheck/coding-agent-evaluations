@@ -78,7 +78,7 @@ def path_mapping(paths: SandboxPaths, task: dict[str, Any]) -> dict[str, str]:
 
     Longest keys are rewritten first so ``/logs/verifier`` wins over ``/logs``.
     """
-    repo_path = str(task.get("repo_path") or "/app")
+    repo_path = str(task.get("container_repo_path") or task.get("repo_path") or "/app")
     mapping = {
         "/logs/verifier": str(paths.logs / "verifier"),
         "/logs/agent": str(paths.logs / "agent"),

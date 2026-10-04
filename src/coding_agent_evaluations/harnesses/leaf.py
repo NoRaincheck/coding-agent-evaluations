@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from frognano.harness.leaf import LeafAgent, LeafConfig
-from frognano.harness.leaf.environment import LeafEnvironment
+from coding_agent_evaluations._vendor.frognano.harness.leaf import LeafAgent, LeafConfig
+from coding_agent_evaluations._vendor.frognano.harness.leaf.environment import (
+    LeafEnvironment,
+)
 
 from .base import HarnessRun
 

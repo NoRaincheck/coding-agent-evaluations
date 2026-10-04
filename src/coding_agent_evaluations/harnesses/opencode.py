@@ -98,6 +98,13 @@ class OpenCodeHarness(CliHarness):
         return environment
 
     def parse(self, run: HarnessRun, stdout: str, exit_code: int) -> dict[str, Any]:
+        """Build a trajectory from opencode's JSONL event stream.
+
+        opencode wraps the payload in a `part` object: `{"type": "tool_use",
+        "part": {"tool": ..., "state": {"input": ..., "output": ...}}}` and
+        `{"type": "text", "part": {"text": ...}}`. Token totals arrive on
+        `step_finish`, one per assistant turn.
+        """
         events = parse_jsonl(stdout)
         steps: list[dict[str, Any]] = []
         messages: list[dict[str, Any]] = []
@@ -105,32 +112,30 @@ class OpenCodeHarness(CliHarness):
         context_tokens = 0
         input_tokens = 0
         output_tokens = 0
+        reasoning_tokens = 0
         for event in events:
             kind = str(event.get("type") or "")
+            part = event.get("part") if isinstance(event.get("part"), dict) else {}
             if kind == "text":
-                final_message = str(event.get("text") or final_message)
+                final_message = str(part.get("text") or final_message)
             elif kind == "tool_use":
-                state = event.get("state") or {}
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
                 steps.append(
                     {
-                        "tool": event.get("tool"),
+                        "tool": part.get("tool"),
                         "input": state.get("input"),
                         "observation": _text_of(state.get("output")),
                         "status": state.get("status"),
                     }
                 )
             elif kind == "step_finish":
-                tokens = event.get("tokens") or {}
-                context_tokens = max(context_tokens, int(tokens.get("input") or 0))
+                tokens = event.get("tokens")
+                tokens = tokens if isinstance(tokens, dict) else {}
                 input_tokens += int(tokens.get("input") or 0)
                 output_tokens += int(tokens.get("output") or 0)
-            elif kind in {"message", "step_start", "session"}:
+                context_tokens = max(context_tokens, int(tokens.get("input") or 0))
+            elif kind in {"step_start", "session"}:
                 messages.append(event)
-        if not final_message:
-            for event in reversed(events):
-                if str(event.get("type") or "") == "text" and event.get("text"):
-                    final_message = str(event["text"])
-                    break
         if exit_code != 0:
             reason = "harness_error"
         else:
@@ -146,6 +151,7 @@ class OpenCodeHarness(CliHarness):
             "usage": {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "reasoning_tokens": reasoning_tokens,
             },
         }
 

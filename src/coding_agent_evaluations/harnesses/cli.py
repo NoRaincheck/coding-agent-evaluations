@@ -24,7 +24,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from frognano.runtimes.errors import CommandTimeoutError
+from coding_agent_evaluations._vendor.frognano.runtimes.errors import (
+    CommandTimeoutError,
+)
 
 from .base import HarnessRun, empty_trajectory
 
@@ -78,6 +80,11 @@ class CliHarness:
         session_id = self.session_id(run)
         command = self.build_command(run, config_dir, session_id)
         environment = self.build_env(run, config_dir, session_id)
+        # `PWD` is inherited from the launching shell and can disagree with the
+        # child's real working directory; a harness that trusts it then edits the
+        # wrong tree. Pin both to the workspace.
+        environment["PWD"] = str(run.workspace)
+        environment.pop("OLDPWD", None)
         timeout = run.max_total_time_sec
         started = time.monotonic()
         exit_code, stdout, stderr, timed_out = self._execute(
@@ -101,8 +108,13 @@ class CliHarness:
             trajectory["timed_out"] = True
         elif exit_code != 0:
             trajectory["timed_out"] = False
-        (config_dir / "stdout.log").write_text(stdout, encoding="utf-8")
-        (config_dir / "stderr.log").write_text(stderr, encoding="utf-8")
+        # Keep the raw streams next to the results: the workspace is deleted when
+        # the run ends, and a harness that dies mid-run leaves no other trace.
+        logs = run.runtime.paths.root / "harness-logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / f"stdout-{run.seed}.log").write_text(stdout, encoding="utf-8")
+        (logs / f"stderr-{run.seed}.log").write_text(stderr, encoding="utf-8")
+        trajectory["logs_dir"] = str(logs)
         return trajectory
 
     def _execute(

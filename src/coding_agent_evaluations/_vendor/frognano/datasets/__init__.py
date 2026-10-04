@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable
+
+from coding_agent_evaluations._vendor.frognano.datasets.harbor import load_harbor_dataset
+from coding_agent_evaluations._vendor.frognano.datasets.patch_eval_verified import SOURCE as PATCH_EVAL_VERIFIED
+from coding_agent_evaluations._vendor.frognano.datasets.patch_eval_verified import load_patch_eval_verified
+from coding_agent_evaluations._vendor.frognano.datasets.source import DatasetSource
+from coding_agent_evaluations._vendor.frognano.datasets.swebench_pro import SOURCE as SWEBENCH_PRO
+from coding_agent_evaluations._vendor.frognano.datasets.swebench_verified import SOURCE as SWEBENCH_VERIFIED
+from coding_agent_evaluations._vendor.frognano.datasets.terminal_bench_2_verified import (
+    SOURCE as TERMINAL_BENCH_2_VERIFIED,
+)
+
+DatasetLoader = Callable[..., list[dict]]
+
+_DATASETS: dict[str, tuple[DatasetSource, DatasetLoader]] = {
+    PATCH_EVAL_VERIFIED.name: (PATCH_EVAL_VERIFIED, load_patch_eval_verified),
+    SWEBENCH_PRO.name: (SWEBENCH_PRO, load_harbor_dataset),
+    SWEBENCH_VERIFIED.name: (SWEBENCH_VERIFIED, load_harbor_dataset),
+    TERMINAL_BENCH_2_VERIFIED.name: (TERMINAL_BENCH_2_VERIFIED, load_harbor_dataset),
+}
+
+
+def get_dataset(name: str) -> tuple[DatasetSource, DatasetLoader]:
+    try:
+        return _DATASETS[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown dataset {name!r}; available: {sorted(_DATASETS)}"
+        ) from exc
+
+
+def load_dataset(
+    name: str,
+    *,
+    cache_dir: Path,
+    image_registry: str | None,
+    task_ids: tuple[str, ...] = (),
+    limit: int | None = None,
+) -> list[dict]:
+    source, loader = get_dataset(name)
+    return loader(
+        source,
+        cache_dir=cache_dir,
+        image_registry=image_registry,
+        task_ids=task_ids,
+        limit=limit,
+    )
+
+
+__all__ = [
+    "DatasetSource",
+    "get_dataset",
+    "load_dataset",
+]

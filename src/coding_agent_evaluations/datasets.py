@@ -12,8 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from frognano.datasets import get_dataset
-from frognano.datasets import load_dataset as _load_dataset
+from coding_agent_evaluations._vendor.frognano.datasets import get_dataset
+from coding_agent_evaluations._vendor.frognano.datasets import (
+    load_dataset as _load_dataset,
+)
 
 SUPPORTED = (
     "swebench_verified",

@@ -267,16 +267,25 @@ def _load_chain(path: Path, seen: frozenset[Path] = frozenset()) -> dict[str, An
     return _merge(resolved, payload)
 
 
-def load_config(path: str | Path) -> RunConfig:
-    """Load a config file, applying ``extends`` inheritance then env expansion."""
+def load_payload(path: str | Path) -> dict[str, Any]:
+    """Resolve a config file's `extends` chain and env expansion, without interpreting it.
+
+    The shared front half of every loader here: `load_config` parses the result as a
+    `RunConfig`, `load_matrix_config` looks for a `matrix:` block in it.
+    """
     candidate = Path(path).expanduser()
     if not candidate.is_file():
         raise ConfigError(f"config file does not exist: {candidate}")
     payload = _load_chain(candidate.resolve())
-    expanded = expand_env(payload)
-    config = RunConfig.from_dict(expanded)
+    return expand_env(payload)
+
+
+def load_config(path: str | Path) -> RunConfig:
+    """Load a config file, applying ``extends`` inheritance then env expansion."""
+    payload = load_payload(path)
+    config = RunConfig.from_dict(payload)
     if config.source is None:
-        config = replace(config, source=str(candidate))
+        config = replace(config, source=str(Path(path).expanduser()))
     return config
 
 

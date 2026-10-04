@@ -11,6 +11,14 @@ extensions and credentials are therefore invisible to the run.
 
 ``--mode json`` gives a JSONL event stream, which is where steps, tool calls and
 token usage come from.
+
+One extension is loaded on purpose, by explicit path: the vendored
+``pi-token-stats`` extension (``--no-extensions`` still honours ``--extension``).
+It is an observer — no prompt, tool or sampling knob changes — and it appends
+time-to-first-token and throughput entries to pi's session JSONL, which is the
+only place pi reports *when* a token arrived rather than only how many there
+were. Those entries are read back into ``trajectory["token_stats"]``; see
+``pi_stats`` and ``harness.options.token_stats``.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ from typing import Any
 
 from .base import HarnessRun
 from .cli import CliHarness, hermetic_env, parse_jsonl
+from .pi_stats import extension_path, read_token_stats, token_stats_enabled
 
 _PROVIDER_ID = "cae-eval"
 
@@ -64,7 +73,7 @@ class PiHarness(CliHarness):
     ) -> list[str]:
         options = dict(run.config.options)
         binary = str(options.get("binary") or self.binary or "pi")
-        session_dir = config_dir / "sessions"
+        session_dir = self.session_dir(config_dir)
         session_dir.mkdir(parents=True, exist_ok=True)
         tools = options.get(
             "tools", ["read", "bash", "edit", "write"]
@@ -92,11 +101,21 @@ class PiHarness(CliHarness):
             "--thinking",
             str(options.get("thinking", "medium")),
         ]
+        # Loaded by path, not by discovery: pi's own extension directory stays out of the
+        # measurement, and only the one pinned observer is in.
+        stats_extension = extension_path(run.config)
+        if stats_extension is not None:
+            command.extend(["--extension", str(stats_extension)])
         if not options.get("context_files", False):
             command.append("--no-context-files")
         # The instruction is passed as the final positional argument.
         command.append(run.runtime.get_task_instruction())
         return command
+
+    @staticmethod
+    def session_dir(config_dir: Path) -> Path:
+        """Where pi writes this rollout's session JSONL."""
+        return config_dir / "sessions"
 
     def build_env(
         self, run: HarnessRun, config_dir: Path, session_id: str
@@ -118,6 +137,10 @@ class PiHarness(CliHarness):
         )
         environment = hermetic_env(dict(os.environ), config_dir)
         environment["PI_CODING_AGENT_DIR"] = str(agent_dir)
+        # The token-speed extension persists its chars-per-token calibration to
+        # `~/.pi/agent` unless told otherwise; keep that inside the rollout.
+        if token_stats_enabled(run.config):
+            environment["PI_TOKEN_SPEED_STATS_DIR"] = str(agent_dir)
         environment.update(run.model.as_env())
         return environment
 
@@ -180,7 +203,7 @@ class PiHarness(CliHarness):
             reason = "max_tokens_per_turn"
         else:
             reason = "agent"
-        return {
+        trajectory = {
             "messages": messages,
             "steps": steps,
             "n_steps": len(steps),
@@ -194,6 +217,30 @@ class PiHarness(CliHarness):
                 "reasoning_tokens": reasoning_tokens,
             },
         }
+        stats = self.collect_token_stats(run)
+        if stats is not None:
+            trajectory["token_stats"] = stats
+        return trajectory
+
+    def collect_token_stats(self, run: HarnessRun) -> dict[str, Any] | None:
+        """Read back the token-speed entries the extension left in the session JSONL.
+
+        pi writes the session, not stdout, so this runs after the CLI exits. Returns ``None``
+        when token stats are switched off, so a trajectory without the key means "not
+        measured" rather than "measured zero".
+        """
+        if extension_path(run.config) is None:
+            return None
+        config_dir = run.runtime.paths.state / f"harness-{self.name}"
+        stats = read_token_stats(self.session_dir(config_dir), self.session_id(run))
+        if not stats["aggregate"]["requests"]:
+            run.logger.warning(
+                "no token_speed_stats entries for %s seed %s; the pi extension may have "
+                "failed to load",
+                run.instance_id,
+                run.seed,
+            )
+        return stats
 
 
 def _models_config(run: HarnessRun) -> dict[str, Any]:

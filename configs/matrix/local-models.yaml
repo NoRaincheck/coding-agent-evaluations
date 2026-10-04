@@ -1,0 +1,42 @@
+# Matrix: several local models across the three harnesses.
+#
+#   cae run --config configs/matrix/local-models.yaml
+#   cae run --config configs/matrix/local-models.yaml --dry-run
+#   cae run --config configs/matrix/local-models.yaml --cells
+#
+# Every cell inherits the settings from configs/base.yaml — the same tasks, seeds, limits and
+# runtime — so the only thing that varies is the model and the harness driving it. That is what
+# makes the rows comparable.
+#
+# Each cell writes to <output_dir>/<dataset>/<harness>/<model>/, so `cae compare` on the
+# output directory lines the whole matrix up.
+extends: [../base.yaml]
+
+# Everything here is deliberately small: a matrix is a comparison, and a comparison that takes
+# days is not one. Scale it up with --set num_tasks=... once the wiring has proved out.
+num_tasks: 2
+seeds_per_task: 1
+max_workers: 1
+max_steps: 10
+max_total_time_sec: 900
+output_dir: ${EVAL_OUTPUT_ROOT:-eval-results}/matrix
+
+matrix:
+  datasets: [swebench_verified]
+  harnesses: [leaf, opencode, pi]
+
+  # A model is either a name (inheriting `base_url` from the base config) or a mapping that
+  # overrides any field of `model:`. Served ids come from the endpoint, not from this file:
+  #   curl -s $EVAL_MODEL_BASE_URL/models | jq -r '.data[].id'
+  #
+  # `cae doctor --config <this file>` asks the endpoint for each of these by name first: a
+  # model the server lists but cannot load (a format it has no runtime for) fails hours into a
+  # run otherwise.
+  models:
+    - frognano-4b-2609
+    - ling-3.0-tiny
+    - name: qwen3.6-35b-a3b-mtp
+      base_url: http://127.0.0.1:1234/v1
+
+  # One cell failing does not void the measurements taken for the others.
+  continue_on_error: true

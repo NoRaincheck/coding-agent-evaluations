@@ -13,3 +13,8 @@ harness:
     binary: ""
     thinking: medium
     tools: [read, bash, edit, write]
+    # Load the vendored pi-token-stats extension and record time-to-first-token, decode and
+    # prefill throughput per assistant message. It is an observer only — no prompt, tool or
+    # sampling setting changes — and the entries land in the trajectory as `token_stats` and
+    # are rolled up into `summary.json`. Set to false to run pi exactly as shipped.
+    token_stats: true

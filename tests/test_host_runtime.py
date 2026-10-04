@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from frognano.runtimes.errors import CommandTimeoutError
 
+from coding_agent_evaluations._vendor.frognano.runtimes.errors import (
+    CommandTimeoutError,
+)
 from coding_agent_evaluations.runtimes.base import (
     CommandExecutor,
     copy_into,
@@ -144,12 +146,22 @@ class FakeRuntime(HostTaskRuntime):
         (self.paths.workspace / "file.txt").write_text("base\n", encoding="utf-8")
         self._snapshot_pristine()
 
-    def _resolve_host_path(self, value: str) -> Path:
-        if value in {"/testbed", "/app", "/workspace"}:
-            return self.paths.workspace
-        candidate = self.paths.root / value.strip("/")
-        candidate.mkdir(parents=True, exist_ok=True)
-        return candidate
+    def _resolve_host_path(self, value: str, *, directory: bool = True) -> Path:
+        # Mirror the production mapping: container paths are remapped onto the
+        # workspace, everything else (`/tmp` included) passes through unchanged.
+        mapping = {
+            "/testbed": self.paths.workspace,
+            "/app": self.paths.workspace,
+            "/workspace": self.paths.workspace,
+            "/tests": self.paths.tests,
+            "/logs": self.paths.logs,
+            "/solution": self.paths.solution,
+        }
+        for original, replacement in sorted(mapping.items(), key=lambda i: -len(i[0])):
+            if value == original or value.startswith(original + "/"):
+                target = Path(str(replacement) + value[len(original) :])
+                return HostTaskRuntime._prepare_destination(target, directory)
+        return HostTaskRuntime._prepare_destination(Path(value), directory)
 
 
 def build_fake(task: dict[str, Any], tmp_path: Path, **options: Any) -> HostTaskRuntime:
@@ -257,6 +269,114 @@ def test_host_runtime_recreate_restores_the_pristine_workspace(tmp_path: Path) -
         assert (runtime.paths.workspace / "file.txt").read_text() == "base\n"
     finally:
         runtime.close()
+
+
+def test_host_runtime_copies_a_file_to_a_file_path(tmp_path: Path) -> None:
+    # The destination must be a file. Creating it unconditionally turned the leaf
+    # tool runner into a directory, and every tool call failed with
+    # "can't find '__main__' module".
+    runtime = build_fake(
+        {"instance_id": "demo", "dataset": "d", "instruction": "x", "repo_path": "/app"},
+        tmp_path,
+    )
+    try:
+        source = tmp_path / "tool_runner.py"
+        source.write_text("print('ok')\n", encoding="utf-8")
+        destination = runtime.paths.root / "bin" / "tool_runner.py"
+        runtime.copy_to_container(source, str(destination))
+        assert destination.is_file()
+        assert destination.read_text() == "print('ok')\n"
+        # Overwriting an existing file works too.
+        source.write_text("print('new')\n", encoding="utf-8")
+        runtime.copy_to_container(source, str(destination))
+        assert destination.read_text() == "print('new')\n"
+    finally:
+        runtime.close()
+
+
+def test_host_runtime_copies_a_directory_to_a_directory_path(tmp_path: Path) -> None:
+    runtime = build_fake(
+        {"instance_id": "demo", "dataset": "d", "instruction": "x", "repo_path": "/app"},
+        tmp_path,
+    )
+    try:
+        source = tmp_path / "payload"
+        source.mkdir()
+        (source / "f.txt").write_text("data\n", encoding="utf-8")
+        destination = runtime.paths.root / "payload-copy"
+        runtime.copy_to_container(source, str(destination))
+        assert destination.is_dir()
+        assert (destination / "f.txt").read_text() == "data\n"
+    finally:
+        runtime.close()
+
+
+def test_host_runtime_recovers_from_a_stale_directory_destination(tmp_path: Path) -> None:
+    runtime = build_fake(
+        {"instance_id": "demo", "dataset": "d", "instruction": "x", "repo_path": "/app"},
+        tmp_path,
+    )
+    try:
+        destination = runtime.paths.root / "bin" / "runner.py"
+        destination.mkdir(parents=True)
+        source = tmp_path / "runner.py"
+        source.write_text("print('ok')\n", encoding="utf-8")
+        runtime.copy_to_container(source, str(destination))
+        assert destination.is_file()
+    finally:
+        runtime.close()
+
+
+def test_leaf_tools_run_against_the_host_workspace(tmp_path: Path) -> None:
+    """The reference leaf environment must be able to use its tools here.
+
+    Leaf passes `task["repo_path"]` to its tool runner, which chdirs into it. If
+    that is still the container path, every tool call fails with
+    FileNotFoundError. This exercises the real LeafEnvironment and the real tool
+    runner, neither of which needs a model.
+    """
+    from coding_agent_evaluations._vendor.frognano.harness.leaf.environment import (
+        LeafEnvironment,
+    )
+
+    runtime = build_fake(
+        {
+            "instance_id": "demo",
+            "dataset": "swebench_verified",
+            "instruction": "x",
+            "repo_path": "/testbed",
+            "require_git_patch": False,
+        },
+        tmp_path,
+    )
+    try:
+        # Stand in for provisioning, as the real runtime does.
+        runtime.task["container_repo_path"] = "/testbed"
+        runtime.task["repo_path"] = str(runtime.paths.workspace)
+        environment = LeafEnvironment(runtime)
+        assert environment.instruction() == "x"
+        assert "Wrote" in environment.execute(
+            "Write", {"file_path": "a.txt", "content": "hello"}
+        )
+        assert (runtime.paths.workspace / "a.txt").read_text() == "hello"
+        assert "hello" in environment.execute("Read", {"file_path": "a.txt"})
+        assert "a.txt" in environment.execute("Glob", {"pattern": "*.txt"})
+        shell = environment.execute("Bash", {"command": "cat a.txt"})
+        assert "hello" in shell and "Exit code: 0" in shell
+    finally:
+        runtime.close()
+
+
+def test_provisioning_and_path_handlers_are_distinct_methods(tmp_path: Path) -> None:
+    """Provisioning and destination creation must not share a name.
+
+    A collision here replaced provisioning with a path helper, and every task
+    failed before the agent could run.
+    """
+    assert callable(HostTaskRuntime._prepare)
+    assert callable(HostTaskRuntime._prepare_destination)
+    assert HostTaskRuntime._prepare_destination(tmp_path / "made", True).is_dir()
+    assert not HostTaskRuntime._prepare_destination(tmp_path / "file", False).exists()
 
 
 def test_host_runtime_close_removes_the_workspace(tmp_path: Path) -> None:

@@ -8,10 +8,14 @@ authors = [
     { name = "NoRaincheck", email = "2498638+NoRaincheck@users.noreply.github.com" }
 ]
 dependencies = [
-    # The reference implementation. Pinned so leaf-harness behaviour is auditable.
-    "frognano @ git+https://github.com/microsoft/FrogNano.git@7077a19d93f38fa0a7afd58b90a0774b25f6b629",
+    "agentsview>=0.44.0",
+    # FrogNano's Leaf harness and dataset sources are vendored under
+    # src/coding_agent_evaluations/_vendor/frognano at commit 7077a19, not
+    # installed as a dependency. See the README's provenance section.
     "openai>=2.0",
     "PyYAML>=6.0",
+    # Matrix runs draw a progress bar over the task-seed pairs.
+    "tqdm>=4.66",
     "tiktoken>=0.7",
 ]
 
@@ -30,3 +34,11 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `tests` is not a package; the matrix helpers it shares are imported as top-level modules,
+# so the directory has to be importable.
+pythonpath = ["tests"]
+
+[tool.ruff]
+# Vendored third-party code is kept as close to upstream as possible, so it is
+# neither linted nor reformatted here. Divergences are marked in-file.
+extend-exclude = ["src/coding_agent_evaluations/_vendor"]

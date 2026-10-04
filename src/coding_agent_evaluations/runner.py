@@ -19,23 +19,28 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import signal
 import sys
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from frognano.runtimes.errors import CommandTimeoutError, PodExecutionError
+from coding_agent_evaluations._vendor.frognano.runtimes.errors import (
+    CommandTimeoutError,
+    PodExecutionError,
+)
 
 from .config import RunConfig
 from .datasets import load_tasks
 from .harnesses import HarnessRun, build_harness
+from .harnesses.pi_stats import merge_aggregates
 from .runtimes import HostTaskRuntime, get_runtime
 
 logger = logging.getLogger(__name__)
@@ -57,20 +62,31 @@ class Job:
         return (str(self.task["instance_id"]), self.seed)
 
 
-def run_evaluation(config: RunConfig) -> dict[str, Any]:
-    """Run one config end to end and write results, summary and trajectories."""
+def run_evaluation(
+    config: RunConfig,
+    *,
+    tasks: Sequence[dict[str, Any]] | None = None,
+    on_result: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run one config end to end and write results, summary and trajectories.
+
+    ``tasks`` may be pre-loaded by a caller that already has the task list, so a matrix does
+    not fetch the same dataset once per cell. ``on_result`` is called with each result row as
+    it is appended, which is what drives the progress bar.
+    """
     output_dir = Path(config.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "results.jsonl"
     write_config(output_dir / "config.json", config)
 
-    tasks = load_tasks(
-        config.dataset,
-        cache_dir=Path(config.cache_dir).expanduser(),
-        task_ids=config.task_ids,
-        limit=config.num_tasks,
-        seed=config.seed,
-    )
+    if tasks is None:
+        tasks = load_tasks(
+            config.dataset,
+            cache_dir=Path(config.cache_dir).expanduser(),
+            task_ids=config.task_ids,
+            limit=config.num_tasks,
+            seed=config.seed,
+        )
     jobs = [Job(task=task, seed=seed) for task in tasks for seed in range(config.seeds_per_task)]
     expected = {job.key for job in jobs}
     processed: set[tuple[str, int]] = set()
@@ -108,6 +124,8 @@ def run_evaluation(config: RunConfig) -> dict[str, Any]:
                 with write_lock:
                     append_result(results_path, result)
                     log_result(result)
+                    if on_result is not None:
+                        on_result(result)
     finally:
         _restore_stop_handlers(previous_handlers)
 
@@ -169,6 +187,7 @@ def _run_job(
             )
             trajectory = harness_cls().run(run)
             trajectory["attempt"] = attempt
+            _retain_harness_logs(trajectory, task_dir, job.seed)
             if trajectory.get("exit_reason") == "cancelled":
                 return _failed_result(job, "cancelled", "evaluation cancelled")
             if trajectory.get("exit_reason") in RETRYABLE_REASONS:
@@ -218,6 +237,9 @@ def _run_job(
                 "harness": config.harness.name,
                 "trajectory": str(task_dir / f"trajectory_seed-{job.seed}.json"),
                 "source": job.task.get("source"),
+                # Per-rollout token speed, when the harness records any. Absent for leaf and
+                # opencode, which expose no equivalent measurement.
+                "token_stats": _token_stats(trajectory),
             }
         except Exception as exc:
             reason = _classify(exc)
@@ -248,6 +270,24 @@ def _run_job(
         attempt=config.max_attempts,
         harness=config.harness.name,
     )
+
+
+def _retain_harness_logs(trajectory: dict[str, Any], task_dir: Path, seed: int) -> None:
+    """Copy a CLI harness's raw output into the results directory.
+
+    The workspace is removed when the run finishes, so without this a harness
+    that dies mid-rollout leaves nothing to diagnose it with.
+    """
+    source = trajectory.get("logs_dir")
+    if not source:
+        return
+    origin = Path(str(source))
+    if not origin.is_dir():
+        return
+    destination = task_dir / f"harness_seed-{seed}"
+    shutil.rmtree(destination, ignore_errors=True)
+    shutil.copytree(origin, destination, dirs_exist_ok=True)
+    trajectory["logs"] = str(destination)
 
 
 def _classify(exc: BaseException) -> str:
@@ -335,6 +375,17 @@ def write_summary(
     if config.seeds_per_task > 1:
         summary["pass_at_k"] = _pass_at_k(completed, k=config.seeds_per_task)
     summary["exit_reasons"] = _count_by(rows, "exit_reason")
+    # Run-level token speed, present only for harnesses that measure it. Rates are weighted by
+    # request count so one long rollout does not drown out the short ones.
+    token_stats = merge_aggregates(
+        [
+            stats
+            for row in completed
+            if isinstance(stats := row.get("token_stats"), dict) and stats
+        ]
+    )
+    if token_stats is not None:
+        summary["token_stats"] = token_stats
     summary["mean_steps"] = _mean(completed, "n_steps")
     summary["mean_elapsed_sec"] = _mean(completed, "elapsed_sec")
     summary["limits"] = _limits(config)
@@ -379,6 +430,15 @@ def _pass_at_k(rows: Sequence[dict[str, Any]], *, k: int) -> dict[str, Any]:
         "solved_tasks": solved,
         "total_tasks": len(tasks),
     }
+
+
+def _token_stats(trajectory: dict[str, Any]) -> dict[str, Any] | None:
+    """The rollout's token-speed aggregate, or ``None`` if the harness recorded none."""
+    stats = trajectory.get("token_stats")
+    if not isinstance(stats, dict):
+        return None
+    aggregate = stats.get("aggregate")
+    return aggregate if isinstance(aggregate, dict) else None
 
 
 def _count_by(rows: Sequence[dict[str, Any]], key: str) -> dict[str, int]:
