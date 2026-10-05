@@ -42,6 +42,33 @@ npm i -g @earendil-works/pi-coding-agent                  # pi
 No model is ever downloaded. The endpoint is reached over the OpenAI chat
 completions API only, and token accounting runs offline (no tokenizer fetch).
 
+## Running it through an agent
+
+A skill lives at
+[`.agents/skills/run-benchmarks/`](.agents/skills/run-benchmarks/), so any agent
+that reads the shared `.agents/skills/` convention — OpenCode, Copilot, Codex,
+Cursor, pi — can run a benchmark without knowing this repository. Install it into
+another project with:
+
+```bash
+npx skills add NoRaincheck/coding-agent-evaluations
+```
+
+The skill drives one script, which wraps `cae` so that every benchmark run
+anywhere gets the same config contract, the same output paths and the same report
+format:
+
+```bash
+uv run --script .agents/skills/run-benchmarks/scripts/benchmark.py run \
+  --model <served-model-id> --base-url <endpoint>
+```
+
+It resolves `cae` from this repository through `uv run --script`, so it needs no
+install step and always uses the same runner version. Its output paths are keyed
+by the run's scale (`n<tasks>s<seeds>st<steps>to<time>w<workers>`), because `cae`'s
+resume matches on `(instance_id, seed)` alone and would otherwise reuse results
+across runs whose limits differ.
+
 ## Quick start
 
 ```bash
