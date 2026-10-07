@@ -13,6 +13,11 @@ Verified** and **Terminal-Bench 2.0 Verified** — once per agent harness:
 The same tasks, model and limits go to every harness, so the resulting
 `summary.json` files are directly comparable.
 
+There is a second runner, `cae ctxbench`, for a question the benchmarks do not
+answer: not *can the model solve this*, but *what does a 64k context cost, does
+retrieval still work at depth, did the harness drop context it could not fit*.
+See [Context scaling](#context-scaling).
+
 Two properties shaped the design:
 
 - **No container runtime, no cluster.** Tasks run natively on the machine, in a
@@ -44,30 +49,35 @@ completions API only, and token accounting runs offline (no tokenizer fetch).
 
 ## Running it through an agent
 
-A skill lives at
-[`.agents/skills/run-benchmarks/`](.agents/skills/run-benchmarks/), so any agent
-that reads the shared `.agents/skills/` convention — OpenCode, Copilot, Codex,
-Cursor, pi — can run a benchmark without knowing this repository. Install it into
-another project with:
+Two skills live under [`.agents/skills/`](.agents/skills/), so any agent that
+reads the shared `.agents/skills/` convention — OpenCode, Copilot, Codex,
+Cursor, pi — can run an evaluation without knowing this repository. Install
+them into another project with:
 
 ```bash
 npx skills add NoRaincheck/coding-agent-evaluations
 ```
 
-The skill drives one script, which wraps `cae` so that every benchmark run
-anywhere gets the same config contract, the same output paths and the same report
-format:
+| Skill | Question it answers |
+|---|---|
+| [`run-benchmarks`](.agents/skills/run-benchmarks/) | Can this model solve these tasks, through this harness? |
+| [`ctxbench`](.agents/skills/ctxbench/) | What does the context cost, and does anything break as it grows? |
+
+Each skill drives one script, which wraps `cae` so that every run anywhere gets
+the same config contract, the same output paths and the same report format:
 
 ```bash
 uv run --script .agents/skills/run-benchmarks/scripts/benchmark.py run \
   --model <served-model-id> --base-url <endpoint>
+
+uv run --script .agents/skills/ctxbench/scripts/ctxbench.py run \
+  --model <served-model-id> --base-url <endpoint>
 ```
 
-It resolves `cae` from this repository through `uv run --script`, so it needs no
-install step and always uses the same runner version. Its output paths are keyed
-by the run's scale (`n<tasks>s<seeds>st<steps>to<time>w<workers>`), because `cae`'s
-resume matches on `(instance_id, seed)` alone and would otherwise reuse results
-across runs whose limits differ.
+Both resolve `cae` from this repository through `uv run --script`, so they need
+no install step and always use the same runner version. Both key their output
+paths by the run's scale, because a resume or a rerun that ignored the limits
+would otherwise reuse results across runs whose limits differ.
 
 ## Quick start
 
@@ -311,12 +321,92 @@ To check the wiring against a served model without running a benchmark:
 
 [pi-token-stats]: https://github.com/NoRaincheck/pi-token-stats
 
+## Context scaling
+
+`cae run` answers *can this model solve this task*. `cae ctxbench` answers a
+different question: as context grows from 16k to 128k, what does it cost, what
+stops working, and does the harness quietly drop what it could not fit?
+
+```bash
+cae ctxbench --config configs/ctxbench.yaml
+cae ctxbench --config configs/ctxbench.yaml --contexts 16000,64000 --json
+```
+
+Five suites, each independent so a failure names itself:
+
+| Suite | What it measures |
+|---|---|
+| `prefill` | Time to first token against a padded prompt asking for one word |
+| `generation` | Decode throughput and end-to-end latency on a fixed coding prompt |
+| `needle` | Retrieval of a definition planted at a known depth |
+| `execution` | pass@1 from real benchmark tasks, at that context budget |
+| `memory` | RSS across repeated large requests |
+
+`prefill` and `generation` talk to the endpoint directly, so they measure the
+endpoint. `execution` pins `max_context_tokens` to the size under test and
+delegates to the same runner `cae run` uses, so pass@1 is graded by the
+benchmark's own verifiers rather than a reimplementation of them.
+
+### Filler that hits the target exactly
+
+A prompt padded to "about 16k" produces a row labelled 16k that is really a
+14,300-token measurement, and the TTFT curve it draws is the curve for a smaller
+context than the one reported. The corpus generator therefore bisects to a
+count and closes the last few tokens with a comment, and the whole corpus is
+`compile()`d. Every generated module parses on its own, so a needle planted at a
+module boundary lands in a valid file. Context sizes are therefore integers, not
+approximations, and the filler is seeded so a rerun reproduces it.
+
+### Five ways a sweep lies to you
+
+Each of these was found by running this against a real endpoint, and each is now
+either prevented or stated in the report:
+
+- **Prefix caching turns repeats into cache reads.** Repeats 2..n send
+  byte-identical prompts, so a cached prefix made a 42-second prefill read as
+  75 milliseconds — and the median of three reported the cache read as the cost
+  of a context. Repeats after the first now carry a unique marker, so TTFT is
+  the cost of a *fresh* context, and the report says so.
+- **A refusal delivered out of band looks like a fast success.** This endpoint
+  rejects an over-long prompt with an SSE `event: error` frame inside an **HTTP
+  200**. A client that reads only `data:` frames sees a 200, an empty stream and
+  no usage — and reports a refused request as a 324 ms prefill with a 0% needle
+  pass rate and no errors at all. The client now reads frame event names and
+  treats an error frame, or any stream that closes without content, as a
+  failure.
+- **A row the endpoint refused is not a measurement of the model.** A 128k row
+  against a model with a 100,096-token window is rejected, not scored. The
+  runner parses the limit out of the error and marks the row as carrying no
+  measurement.
+- **A reasoning model can spend its whole answer budget thinking.** Needle
+  trials that produce no reply are recorded as *unobservable* and kept out of
+  the pass-rate denominator, and are retried once with a larger budget first.
+  Counting them as failures would report the token budget as a model property.
+- **Local token counts are not the model's vocabulary.** Sizes are labelled by
+  `o200k_base` by default, which on this project under-counts by ~1.23x against
+  the endpoint. The server's own count is reported separately, so a reader can
+  tell which number describes what the endpoint saw.
+
+Anything a suite did not measure reads `-`, never `0`, and every rate carries its
+denominator. `cae ctxbench` exits non-zero when any suite recorded an error, so
+a pipeline can tell a clean sweep from a half-measured one.
+
 ## How it works
 
 ```
 config  ──▶ datasets ──▶ runtime (host) ──▶ harness ──▶ verifier ──▶ summary
                             │
                             └─ provisions the workspace the image would provide
+```
+
+`ctxbench` is a separate path over the same pieces — `ModelConfig`, the dataset
+loader, the host runtime and the runner — because the speed and retrieval suites
+need no workspace at all:
+
+```
+ladder ──▶ filler (exact tokens) ──▶ endpoint probe ──▶ per-size row
+   │                                                        │
+   └────────────────────▶ execution ──▶ cae run ────────────┘
 ```
 
 **Datasets** come from FrogNano's pinned sources, so dataset revisions,
@@ -455,6 +545,14 @@ verifier translation, the command executor's exit-code/timeout/checksum
 behaviour, Dockerfile parsing, patch capture, reward extraction, matrix expansion
 and progress accounting, pi token-speed reading and roll-up, harness
 configuration generation and the comparison report. It does not call a model.
+
+`ctxbench`'s tests are offline too. The filler generator is checked against the
+exact-token guarantee at every ladder size, the needle scorer against every way a
+reply can nearly match, and the endpoint client against a fake HTTP server rather
+than a served model — which is what makes the properties worth testing checkable
+here: that a truncation is detected, that a refused request is not scored as a
+model failure, that a trial with no reply leaves the denominator, and that a
+prefix-cache-busted repeat really is a distinct prompt.
 
 ### Running the tests against a config matrix
 

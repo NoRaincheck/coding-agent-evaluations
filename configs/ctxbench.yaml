@@ -1,0 +1,72 @@
+# Context-scaling sweep.
+#
+# Measures the endpoint and the harness as context grows, which is a different question
+# from `cae run`: that one asks whether the task got solved, this one asks what the cost
+# of the context was and whether anything was quietly dropped along the way.
+#
+# Inherits `model:`, `runtime:` and the output layout from base.yaml so both runners are
+# configured the same way and a ctxbench report sits next to a benchmark report without
+# translation.
+#
+#   EVAL_MODEL_NAME=frognano-4b-2609
+#   EVAL_MODEL_BASE_URL=http://127.0.0.1:1234/v1
+extends: [./base.yaml]
+
+output_dir: ${EVAL_OUTPUT_ROOT:-eval-results}/ctxbench
+
+# The ladder to sweep. Sorted and de-duplicated on load, so the printed x-axis always
+# reads smallest to largest.
+context_sizes: [16000, 32000, 64000, 128000]
+
+# Which agent harness drives the pass@1 suite. The speed and retrieval suites talk to the
+# endpoint directly and are unaffected by this.
+harness:
+  name: leaf
+
+seed: 42
+
+ctxbench:
+  # Trim this for a smoke run: `--suites prefill,generation,needle`.
+  enabled: [prefill, generation, needle, execution, memory]
+
+  # Speed is noisy enough that a single sample is an anecdote, not a number. The median of
+  # three is the smallest figure worth reporting.
+  repeats: 3
+
+  # One word out. Prefill cost and decode cost are different regressions; asking for more
+  # than one word measures both at once and cannot separate them. The ceiling is still
+  # generous, because a reasoning model that cannot finish thinking inside it produces no
+  # reply at all -- and that trial is then recorded as unobservable, not as a failure.
+  prefill_max_tokens: 64
+  generation_max_tokens: 512
+
+  # Spread across depth, not sampled randomly, so every row probes the same positions and
+  # the pass rates compare. Odd trials use AST-scored signature needles, even trials
+  # literal ones, so both matchers are exercised.
+  needle_trials: 6
+  needle_max_tokens: 512
+  # A trial that produced no reply is retried once at this budget before being recorded as
+  # unobservable. Generous, and therefore expensive on a reasoning model: a rescued trial
+  # costs a full-budget request. Lower it to keep a sweep short, at the cost of some trials
+  # leaving the pass-rate denominator.
+  needle_retry_max_tokens: 4096
+
+  # pass@1 comes from real benchmark tasks graded by their own verifiers. `ctxbench` pins
+  # max_context_tokens to the size under test and delegates to the existing runner, so
+  # grading is the benchmark's and not a reimplementation of it.
+  execution_num_tasks: 2
+  execution_seeds: 1
+  execution_max_steps: 50
+  execution_max_time_sec: 1800
+
+  # Repeat the largest request and watch RSS. Run once for the whole sweep: the question
+  # is whether repeated large-context handling leaks, not which size leaks most.
+  memory_iterations: 10
+  # Defaults to the largest context size when unset.
+  memory_context_tokens: null
+
+  # Token accounting. `o200k_base` resolves offline, so a run never fetches a tokenizer.
+  tokenizer: o200k_base
+  request_timeout_sec: 900
+  retries: 1
+  corpus_cache: ${EVAL_CACHE_DIR:-~/.cache/cae}/ctxbench

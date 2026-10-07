@@ -9,9 +9,14 @@ import sys
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .config import ConfigError, RunConfig, apply_overrides, load_config
+from .ctxbench import load_ctx_config, run_ctxbench
+from .ctxbench.config import SUITES
+from .ctxbench.report import as_json as ctx_as_json
+from .ctxbench.report import as_markdown as ctx_as_markdown
 from .datasets import SUPPORTED, describe, load_tasks
 from .doctor import format_checks, run_checks
 from .matrix import MatrixConfig, load_run_or_matrix
@@ -114,6 +119,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("paths", nargs="+", help="summary.json files or run directories")
     compare.add_argument("--markdown", action="store_true", help="emit a markdown table")
+
+    ctx = subparsers.add_parser(
+        "ctxbench",
+        help="sweep context sizes: speed, retrieval, pass@1, harness health",
+    )
+    ctx.add_argument("--config", required=True, help="path to a ctxbench config YAML")
+    ctx.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="override a config value, e.g. --set seed=7",
+    )
+    ctx.add_argument(
+        "--contexts",
+        help="comma-separated token ladder, e.g. 16000,32000,64000,128000",
+    )
+    ctx.add_argument(
+        "--harness",
+        choices=_HARNESSES,
+        help="harness for the pass@1 suite (default: leaf)",
+    )
+    ctx.add_argument(
+        "--suites",
+        help=f"comma-separated subset of: {', '.join(SUITES)}",
+    )
+    ctx.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="print the JSON payload instead of the table",
+    )
+    ctx.add_argument(
+        "--plan",
+        action="store_true",
+        help="print the resolved config and ladder, then exit",
+    )
+    ctx.add_argument(
+        "--no-progress", action="store_true", help="do not log each context size"
+    )
     return parser
 
 
@@ -136,6 +182,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_config(args)
         if args.command == "compare":
             return _cmd_compare(args)
+        if args.command == "ctxbench":
+            return _cmd_ctxbench(args)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
@@ -143,6 +191,61 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 1
+
+
+def _cmd_ctxbench(args: argparse.Namespace) -> int:
+    overrides = list(getattr(args, "overrides", []) or [])
+    if args.contexts:
+        overrides.append("context_sizes=" + json.dumps(_int_list(args.contexts)))
+    if args.harness:
+        overrides.append(f"harness={args.harness}")
+    if args.suites:
+        overrides.append("ctxbench.enabled=" + json.dumps(_name_list(args.suites)))
+    config = load_ctx_config(args.config, overrides)
+
+    if args.plan:
+        print(json.dumps(config.as_dict(), indent=2))
+        return 0
+
+    def on_size(result: Any) -> None:
+        if args.no_progress:
+            return
+        rows = result.as_dict()
+        print(
+            f"  {result.context_size_tokens:>7,} tokens  "
+            f"needle {rows['correctness'].get('needle_in_haystack_pass_rate')}",
+            flush=True,
+        )
+
+    payload = run_ctxbench(config, on_size=on_size)
+    # The table is printed even when suites failed, so a failed run still reports what it
+    # managed to measure; the exit code is what says it was incomplete.
+    print(ctx_as_json(payload) if args.as_json else ctx_as_markdown(payload))
+    errors = sum(len(row.get("errors") or []) for row in payload.get("results", []))
+    return 1 if errors else 0
+
+
+def _int_list(value: str) -> list[int]:
+    """Parse a comma-separated token ladder, rejecting anything non-numeric.
+
+    A silently ignored entry would shift every later row off its label, so this raises
+    rather than skipping.
+    """
+    out: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if not item.isdigit():
+            raise ConfigError(f"context size must be a positive integer, got {item!r}")
+        out.append(int(item))
+    if not out:
+        raise ConfigError("no context sizes given")
+    return out
+
+
+def _name_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
@@ -282,13 +385,23 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     model = None
     harnesses: tuple[str, ...] = tuple(args.harness) or _HARNESSES
     if args.config:
-        config = load_run_or_matrix(args.config)
-        if isinstance(config, MatrixConfig):
-            return _doctor_matrix(config, args)
-        model = config.model
-        cache_dir = Path(config.cache_dir).expanduser()
-        workspace_root = Path(config.runtime.root).expanduser()
-        harnesses = tuple(dict.fromkeys((config.harness.name, *harnesses)))
+        # A ctxbench config is a different shape, and pointing `doctor` at one is the
+        # natural thing to do before a sweep. Detected by the `ctxbench:` block rather than
+        # by trial and error, so a genuine config error is still reported as one.
+        if _is_ctxbench_config(args.config):
+            config = load_ctx_config(args.config)
+            model = config.model
+            cache_dir = config.suites.cache_dir
+            workspace_root = config.runtime.root
+            harnesses = tuple(dict.fromkeys((config.harness, *harnesses)))
+        else:
+            config = load_run_or_matrix(args.config)
+            if isinstance(config, MatrixConfig):
+                return _doctor_matrix(config, args)
+            model = config.model
+            cache_dir = Path(config.cache_dir).expanduser()
+            workspace_root = Path(config.runtime.root).expanduser()
+            harnesses = tuple(dict.fromkeys((config.harness.name, *harnesses)))
     checks = run_checks(
         model=model,
         harnesses=harnesses,
@@ -297,6 +410,25 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     )
     print(format_checks(checks))
     return 0 if all(check.ok for check in checks) else 1
+
+
+def _is_ctxbench_config(path: str | Path) -> bool:
+    """Whether a config file describes a ctxbench sweep rather than a benchmark run.
+
+    Keyed on the `ctxbench:` block alone, which is what the ctxbench loader requires and
+    what nothing else writes. Keyed on the *absence* of `dataset:` instead would misread
+    the shipped `configs/ctxbench.yaml`, which extends `base.yaml` and therefore resolves
+    to a payload that has both.
+    """
+    from .config import load_payload
+
+    try:
+        payload = load_payload(path)
+    except ConfigError:
+        # A config that will not even parse is not a ctxbench config; let the real loader
+        # report why it is broken.
+        return False
+    return "ctxbench" in payload
 
 
 def _doctor_matrix(matrix: MatrixConfig, args: argparse.Namespace) -> int:
